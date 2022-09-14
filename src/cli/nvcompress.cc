@@ -35,20 +35,24 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <cufile.h>
+#include <nvcomp/lz4.hpp>
+#include <nvcomp.hpp>
+#include <nvcomp/nvcompManagerFactory.hpp>
 #include <spdlog/spdlog.h>
 #include <spdlog/cfg/env.h>
 
 #include <draft/util/Util.hh>
+#include <draft/util/Writer.hh>
 #include "Cmd.hh"
 
 namespace {
 
-using namespace draft;
+using namespace draft::util;
 
 struct CompressOptions
 {
-    std::string inPath{"in"};
-    std::string outPath{ };
+    std::filesystem::path inPath{ };
+    std::filesystem::path outPath{ };
     size_t blockSize{1u << 20};
     size_t chunkSize{1u << 16};
 };
@@ -61,12 +65,73 @@ struct CudaError: public std::runtime_error
     }
 };
 
+CUfileHandle_t cuFileRegister(const ScopedFd &fd)
+{
+    auto cuDesc = CUfileDescr_t{ };
+    cuDesc.handle.fd = fd.get();
+    cuDesc.type = CU_FILE_HANDLE_TYPE_OPAQUE_FD;
+
+    auto cuHandle = CUfileHandle_t{ };
+
+    if (auto stat = cuFileHandleRegister(&cuHandle, &cuDesc);
+        stat.err != CU_FILE_SUCCESS)
+    {
+        throw std::runtime_error("draft.compress: unable to register file");
+    }
+
+    return cuHandle;
+}
+
+class CudaBuffer
+{
+public:
+    CudaBuffer() = default;
+
+    explicit CudaBuffer(std::size_t size)
+    {
+        cudaMalloc(&data_, size);
+        if (auto err = cudaGetLastError(); err != cudaSuccess)
+            throw CudaError(err);
+
+        size_ = size;
+
+        fileBuf_ = false;
+    }
+
+    ~CudaBuffer() noexcept
+    {
+        if (fileBuf_)
+            cuFileBufDeregister(data_);
+
+        cudaFree(data_);
+    }
+
+    uint8_t *data() noexcept { return data_; }
+
+    void fileBufRegister()
+    {
+        if (auto stat = cuFileBufRegister(data_, size_, 0);
+            stat.err != CU_FILE_SUCCESS)
+        {
+            throw std::runtime_error("draft.compress: unable to register file buffer.");
+        }
+        fileBuf_ = true;
+    }
+
+private:
+    uint8_t *data_{ };
+    std::size_t size_{ };
+    bool fileBuf_{ };
+};
+
 CompressOptions parseOptions(int argc, char **argv)
 {
-    constexpr const char *shortOpts = "b:c:h";
+    constexpr const char *shortOpts = "b:c:i:o:h";
     constexpr const struct option longOpts[] = {
         {"block-size", required_argument, nullptr, 'b'},
         {"chunk-size", required_argument, nullptr, 'c'},
+        {"in-path", required_argument, nullptr, 'i'},
+        {"out-path", required_argument, nullptr, 'o'},
         {"help", no_argument, nullptr, 'h'},
         {nullptr, 0, nullptr, 0}
     };
@@ -76,7 +141,7 @@ CompressOptions parseOptions(int argc, char **argv)
 
     const auto usage = [argv] {
             std::cout << fmt::format(
-                "usage: {} compress [-b <block size>][-c <chunk size>[-h] <file>\n"
+                "usage: {} compress [-b <block size>][-c <chunk size>][-h] -i <in-file> -o <out-file>\n"
                 , ::basename(argv[0]));
         };
 
@@ -112,6 +177,16 @@ CompressOptions parseOptions(int argc, char **argv)
 
                 break;
             }
+            case 'i':
+            {
+                opts.inPath = optarg;
+                break;
+            }
+            case 'o':
+            {
+                opts.outPath = optarg;
+                break;
+            }
             case 'h':
                 usage();
                 std::exit(0);
@@ -133,67 +208,105 @@ CompressOptions parseOptions(int argc, char **argv)
 
 void compress(const CompressOptions &opts)
 {
-	CUfileDescr_t cfr_descr;
-	CUfileHandle_t cfr_handle;
+    auto outFd = ScopedFd{open(opts.outPath.c_str(), O_WRONLY | O_DIRECT)};
+    auto cuOutHandle = cuFileRegister(outFd);
 
-    auto fd = util::ScopedFd{open(opts.inPath.c_str(), O_RDONLY | O_DIRECT)};
-
-    if (fd.get() < 0)
-        throw std::system_error(errno, std::system_category(), "draft.compress: open");
-
-    const auto fileSize = std::filesystem::file_size(opts.inPath);
-
-    auto desc = CUfileDescr_t{ };
-    desc.handle.fd = fd.get();
-    desc.type = CU_FILE_HANDLE_TYPE_OPAQUE_FD;
-
-    auto handle = CUfileHandle_t{ };
-
-    if (auto stat = cuFileHandleRegister(&handle, &desc);
-        stat.err != CU_FILE_SUCCESS)
-    {
-        throw std::runtime_error(fmt::format("draft.compress: unable to register file '{}'", opts.inPath));
-    }
+    auto inFd = ScopedFd{open(opts.inPath.c_str(), O_RDONLY | O_DIRECT)};
+    auto cuInHandle = cuFileRegister(inFd);
 
     cudaSetDevice(0);
     if (auto err = cudaGetLastError(); err != cudaSuccess)
         throw CudaError(err);
 
-    uint8_t *gpuInBuf{ };
-    uint8_t *gpuOutBuf{ };
-
-    cudaMalloc(&gpuInBuf, opts.blockSize);
+    auto stream = cudaStream_t{ };
+    cudaStreamCreate(&stream);
     if (auto err = cudaGetLastError(); err != cudaSuccess)
         throw CudaError(err);
 
-    if (auto stat = cuFileBufRegister(gpuInBuf, opts.blockSize, 0);
-        stat.err != CU_FILE_SUCCESS)
-    {
-        throw std::runtime_error("draft.compress: unable to register file buffer.");
-    }
+    auto nvcompManager = nvcomp::LZ4Manager{opts.chunkSize, NVCOMP_TYPE_CHAR, stream};
+    auto compressConfig = nvcompManager.configure_compression(opts.blockSize);
 
-    for (size_t offset = 0; offset < fileSize; )
-    {
-        auto len = cuFileRead(handle, gpuInBuf, opts.blockSize, static_cast<off_t>(offset), 0);
+    auto gpuInBuf = CudaBuffer(opts.blockSize);
+    gpuInBuf.fileBufRegister();
 
-        if (len < 0)
+    auto gpuScratchBuf = CudaBuffer(nvcompManager.get_required_scratch_buffer_size());
+    nvcompManager.set_scratch_buffer(gpuScratchBuf.data());
+
+    auto gpuOutBuf = CudaBuffer(compressConfig.max_compressed_buffer_size);
+
+    int64_t fileReadMicrosecs = 0;
+    int64_t compressMicrosecs = 0;
+
+    size_t outOffset = 0;
+
+    size_t fileSize = std::filesystem::file_size(opts.inPath);
+    for (size_t inOffset = 0; inOffset < fileSize; )
+    {
+        std::chrono::steady_clock::time_point fileReadBegin = std::chrono::steady_clock::now();
+        auto inLen = cuFileRead(cuInHandle, gpuInBuf.data(), opts.blockSize, static_cast<off_t>(inOffset), 0);
+        std::chrono::steady_clock::time_point fileReadEnd = std::chrono::steady_clock::now();
+        fileReadMicrosecs += std::chrono::duration_cast<std::chrono::microseconds>(fileReadEnd - fileReadBegin).count();
+
+        if (inLen < 0)
         {
-            spdlog::error("cuFileRead returned {}", len);
+            spdlog::error("cuFileRead returned {}", inLen);
             break;
         }
 
-        if (!len)
+        if (!inLen)
         {
             spdlog::error("cuFileRead returned 0 - ending transfer.");
             break;
         }
 
-        offset += static_cast<size_t>(len);
+        std::chrono::steady_clock::time_point compressBegin = std::chrono::steady_clock::now();
+        nvcompManager.compress(gpuInBuf.data(), gpuOutBuf.data(), compressConfig);
+        std::chrono::steady_clock::time_point compressEnd = std::chrono::steady_clock::now();
+        compressMicrosecs += std::chrono::duration_cast<std::chrono::microseconds>(compressEnd - compressBegin).count();
+
+        if (auto stat = compressConfig.get_status(); *stat > 0)
+        {
+            spdlog::error("draft.compress: compression failed:\n"
+                          "  nvcompStatus {}"
+                          ,  *stat);
+            cudaFree(gpuOutBuf.data());
+            break;
+        }
+
+        size_t outLen = nvcompManager.get_compressed_output_size(gpuOutBuf.data());
+
+        if (outLen > inLen)
+        {
+            spdlog::warn("nvcomp compression failed - output larger than input\n"
+                         "  is file already compressed?\n"
+                         "  output > input -> {} > {}"
+                         ,  outLen
+                         ,  inLen);
+        }
+
+        spdlog::trace("compression info:\n"
+                      "  in size:           {} B\n"
+                      "  out size:          {} B\n"
+                      "  max out size:      {} B\n"
+                      "  compression ratio: {} %"
+                      ,  inLen
+                      ,  outLen
+                      ,  compressConfig.max_compressed_buffer_size
+                      ,  static_cast<double>(outLen) / static_cast<double>(inLen));
+
+        cuFileWrite(cuOutHandle, gpuOutBuf.data(), outLen, static_cast<off_t>(outOffset), 0);
+
+        inOffset += static_cast<size_t>(inLen);
+        outOffset += static_cast<size_t>(outLen);
     }
 
-    cuFileBufDeregister(gpuInBuf);
-    cudaFree(gpuInBuf);
-    //cudaFree(gpuOutBuf);
+    double secToUsec = 1'000'000.0;
+    double GbyteToByte = 1'000'000'000.0;
+
+    spdlog::info("file read avg. GB/s: {}"
+                 , (fileSize / GbyteToByte) / (fileReadMicrosecs / secToUsec));
+    spdlog::info("compress avg. GB/s:  {}"
+                 , (fileSize / GbyteToByte) / (compressMicrosecs / secToUsec));
 }
 
 } // namespace
