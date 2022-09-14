@@ -309,7 +309,7 @@ void compress(const CompressOptions &opts)
 
     size_t outFileSize = std::filesystem::file_size(opts.outPath);
 
-    spdlog::info("compression ratio:       {}", outFileSize / fileSize);
+    spdlog::info("compression ratio:       {}", static_cast<double>(outFileSize) / static_cast<double>(fileSize));
     spdlog::info("file read avg. GB/s:     {}"
                  , (fileSize / bytePerGbyte) / (fileReadMicrosecs / microsecPerSec));
     spdlog::info("compress avg. GB/s:      {}"
