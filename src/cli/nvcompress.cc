@@ -240,6 +240,8 @@ void compress(const CompressOptions &opts)
     size_t outOffset = 0;
 
     size_t fileSize = std::filesystem::file_size(opts.inPath);
+
+    std::chrono::steady_clock::time_point fullCompressBegin = std::chrono::steady_clock::now();
     for (size_t inOffset = 0; inOffset < fileSize; )
     {
         std::chrono::steady_clock::time_point fileReadBegin = std::chrono::steady_clock::now();
@@ -299,14 +301,21 @@ void compress(const CompressOptions &opts)
         inOffset += static_cast<size_t>(inLen);
         outOffset += static_cast<size_t>(outLen);
     }
+    std::chrono::steady_clock::time_point fullCompressEnd = std::chrono::steady_clock::now();
+    auto fullCompressMicrosecs = std::chrono::duration_cast<std::chrono::microseconds>(fullCompressEnd - fullCompressBegin).count();
 
-    double secToUsec = 1'000'000.0;
-    double GbyteToByte = 1'000'000'000.0;
+    double microsecPerSec = 1'000'000.0;
+    double bytePerGbyte = 1'000'000'000.0;
 
-    spdlog::info("file read avg. GB/s: {}"
-                 , (fileSize / GbyteToByte) / (fileReadMicrosecs / secToUsec));
-    spdlog::info("compress avg. GB/s:  {}"
-                 , (fileSize / GbyteToByte) / (compressMicrosecs / secToUsec));
+    size_t outFileSize = std::filesystem::file_size(opts.outPath);
+
+    spdlog::info("compression ratio:       {}", outFileSize / fileSize);
+    spdlog::info("file read avg. GB/s:     {}"
+                 , (fileSize / bytePerGbyte) / (fileReadMicrosecs / microsecPerSec));
+    spdlog::info("compress avg. GB/s:      {}"
+                 , (fileSize / bytePerGbyte) / (compressMicrosecs / microsecPerSec));
+    spdlog::info("full compress avg. GB/s: {}"
+                 , (fileSize / bytePerGbyte) / (fullCompressMicrosecs / microsecPerSec));
 }
 
 } // namespace
