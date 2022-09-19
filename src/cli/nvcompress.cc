@@ -62,6 +62,7 @@ struct CompressOptions
     std::filesystem::path outPath{ };
     size_t blockSize{1u << 20};
     size_t chunkSize{1u << 16};
+    bool cudaFileIO{false};
 };
 
 struct CudaError: public std::runtime_error
@@ -138,18 +139,25 @@ public:
 
     Compressor(BufQueue &queue, BufQueue &compressQueue, size_t chunkSize, size_t blockSize):
         queue_{&queue},
-        compressQueue_{&compressQueue},
-        chunkSize_{chunkSize}
+        compressQueue_{&compressQueue}
     {
         stream_ = cudaStream_t{ };
         cudaStreamCreate(&stream_);
         if (auto err = cudaGetLastError(); err != cudaSuccess)
             throw CudaError(err);
 
-        nvcompManager_ = std::make_unique<nvcomp::LZ4Manager>(chunkSize_, NVCOMP_TYPE_CHAR, stream_);
+        nvcompManager_ = std::make_unique<nvcomp::LZ4Manager>(chunkSize, NVCOMP_TYPE_CHAR, stream_);
         compressConfig_ = std::make_unique<nvcomp::CompressionConfig>(nvcompManager_->configure_compression(blockSize));
 
+        gpuInBuf_ = std::make_unique<CudaBuffer>(blockSize);
+
+        gpuScratchBuf_ = std::make_unique<CudaBuffer>(nvcompManager_->get_required_scratch_buffer_size());
+        nvcompManager_->set_scratch_buffer(gpuScratchBuf_->data());
+
+        gpuOutBuf_ = std::make_unique<CudaBuffer>(compressConfig_->max_compressed_buffer_size);
+
         pool_ = BufferPool::make(compressConfig_->max_compressed_buffer_size, 5);
+        alignPool_ = BufferPool::make(4096, 5);
     }
 
     bool runOnce(std::stop_token stopToken)
@@ -165,18 +173,9 @@ public:
 private:
     size_t compress(std::stop_token stopToken, BDesc desc)
     {
-        auto gpuInBuf = CudaBuffer(desc.len);
-        cudaMemcpy(gpuInBuf.data(), desc.buf->uint8Data(), desc.len, cudaMemcpyHostToDevice);
+        cudaMemcpy(gpuInBuf_->data(), desc.buf->uint8Data(), desc.len, cudaMemcpyHostToDevice);
 
-        auto gpuScratchBuf = CudaBuffer(nvcompManager_->get_required_scratch_buffer_size());
-        nvcompManager_->set_scratch_buffer(gpuScratchBuf.data());
-
-        auto gpuOutBuf = CudaBuffer(compressConfig_->max_compressed_buffer_size);
-
-        std::chrono::steady_clock::time_point compressBegin = std::chrono::steady_clock::now();
-        nvcompManager_->compress(gpuInBuf.data(), gpuOutBuf.data(), *compressConfig_);
-        std::chrono::steady_clock::time_point compressEnd = std::chrono::steady_clock::now();
-        spdlog::trace("compression time (us): {}", std::chrono::duration_cast<std::chrono::microseconds>(compressEnd - compressBegin).count());
+        nvcompManager_->compress(gpuInBuf_->data(), gpuOutBuf_->data(), *compressConfig_);
 
         if (auto stat = compressConfig_->get_status(); *stat > 0)
         {
@@ -186,19 +185,79 @@ private:
             return 0;
         }
 
-        size_t outLen = nvcompManager_->get_compressed_output_size(gpuOutBuf.data());
-        auto outBuf = std::make_shared<Buffer>(pool_->get());
-        cudaMemcpy(outBuf->uint8Data(), gpuOutBuf.data(), outLen, cudaMemcpyDeviceToHost);
+        size_t outLen = nvcompManager_->get_compressed_output_size(gpuOutBuf_->data());
 
+        if (outLen > desc.len)
+        {
+            spdlog::warn("draft.compress: nvcomp compression failed - output larger than input\n"
+                         "  is file already compressed?\n"
+                         "  output > input -> {} > {}"
+                         ,  outLen
+                         ,  desc.len);
+        }
+
+        auto outBuf = std::make_shared<Buffer>(pool_->get());
+
+        cudaMemcpy(outBuf->uint8Data() + alignOffset_,
+                   gpuOutBuf_->data(),
+                   outLen,
+                   cudaMemcpyDeviceToHost);
+
+        if (alignOffset_ > 0 && alignBuf_)
+        {
+            std::memcpy(outBuf->uint8Data(), alignBuf_->uint8Data(), alignOffset_);
+            outLen += alignOffset_;
+            spdlog::trace("draft.compress: added previous align offset {} to outLen"
+                          ,  alignOffset_);
+        }
+
+        spdlog::trace("draft.compress: compression info:\n"
+                      "  in size:           {} B\n"
+                      "  out size:          {} B\n"
+                      "  max out size:      {} B\n"
+                      "  compression ratio: {} %"
+                      ,  desc.len
+                      ,  outLen
+                      ,  compressConfig_->max_compressed_buffer_size
+                      ,  static_cast<double>(outLen) / static_cast<double>(desc.len));
+
+        auto alignMult = static_cast<double>(outLen) / 4096.0;
+        alignOffset_ = static_cast<size_t>((alignMult - std::floor(alignMult)) * 4096.0);
+        size_t alignLen = outLen - alignOffset_;
+
+        double newAlignMult = static_cast<double>(alignLen) / 4096.0;
+        spdlog::trace("draft.compress: compression alignment:\n"
+                      "  output len:              {}\n"
+                      "  alignment offset:        {}\n"
+                      "  alignment len:           {}\n"
+                      "  output len / 4096.0:     {}\n"
+                      "  alignment len / 4096.0:  {}"
+                      ,  outLen
+                      ,  alignOffset_
+                      ,  alignLen
+                      ,  alignMult
+                      ,  newAlignMult);
+
+        if (alignLen > compressConfig_->max_compressed_buffer_size)
+            throw std::runtime_error("nvcomp aligned buffer is greater than buffer size");
+
+        spdlog::trace("draft.compress: offset into output file: {}", totalOffset_);
         while (!stopToken.stop_requested() &&
-            !compressQueue_->put({outBuf, 1u, desc.offset, outLen}, 100ms))
+            !compressQueue_->put({outBuf, 1u, totalOffset_, alignLen}, 100ms))
         {
         }
+
+        alignBuf_ = std::make_shared<Buffer>(alignPool_->get());
+
+        std::memcpy(alignBuf_->uint8Data(), outBuf->uint8Data() + alignLen, alignOffset_);
+
+        totalOffset_ += static_cast<size_t>(alignLen);
 
         return outLen;
     }
 
     BufferPoolPtr pool_{ };
+    BufferPoolPtr alignPool_{ };
     BufQueue *queue_{ };
     BufQueue *compressQueue_{ };
 
@@ -206,19 +265,144 @@ private:
     std::unique_ptr<nvcomp::LZ4Manager> nvcompManager_{ };
     std::unique_ptr<nvcomp::CompressionConfig> compressConfig_{ };
 
-    size_t chunkSize_{ };
+    std::unique_ptr<CudaBuffer> gpuInBuf_{ };
+    std::unique_ptr<CudaBuffer> gpuScratchBuf_{ };
+    std::unique_ptr<CudaBuffer> gpuOutBuf_{ };
 
+    std::shared_ptr<Buffer> alignBuf_{ };
+    size_t alignOffset_{ };
 
+    size_t totalOffset_{ };
+};
+
+class CompSession
+{
+public:
+    CompSession(const CompressOptions &opts)
+    {
+        readPool_ = BufferPool::make(opts.blockSize, 100);
+        readQueue_.setSizeLimit(100);
+
+        readExec_.resize(1);
+        readExec_.setQueueSizeLimit(10);
+
+        auto compressors = std::vector<Compressor>{ };
+        for (size_t i = 0; i < 1; ++i)
+        {
+            auto compressor = Compressor{readQueue_, writeQueue_, opts.chunkSize, opts.blockSize};
+            compressors.push_back(std::move(compressor));
+        }
+        compressExec_.add(std::move(compressors), ThreadExecutor::Options::DoFinalize);
+
+        writeQueue_.setSizeLimit(100);
+    }
+
+    ~CompSession() noexcept
+    {
+        finish();
+    }
+
+    void start(const std::filesystem::path &inPath, const std::filesystem::path &outPath)
+    {
+        auto inFd = std::make_shared<ScopedFd>(open(inPath.c_str(), O_RDONLY | O_DIRECT));
+        auto rawInFd = inFd->get();
+        if (rawInFd < 0)
+        {
+            spdlog::error("unable to open file '{}': {}"
+                          , inPath.c_str()
+                          , std::strerror(errno));
+            throw std::runtime_error("unable to open file for reading");
+        }
+        auto outFd = std::make_shared<ScopedFd>(open(outPath.c_str(), O_WRONLY | O_DIRECT));
+        auto rawOutFd = outFd->get();
+        if (rawOutFd < 0)
+        {
+            spdlog::error("unable to open file '{}': {}"
+                          , outPath.c_str()
+                          , std::strerror(errno));
+            throw std::runtime_error("unable to open file for writing");
+        }
+
+        size_t fileSize = std::filesystem::file_size(inPath);
+
+        const auto deadline = Clock::now() + 50ms;
+        while (!readExec_.cancelled() && Clock::now() < deadline)
+        {
+            const auto rateDeadline = Clock::now() + 1ms;
+
+            auto reader = Reader(inFd, 0u, {0, fileSize}, readPool_, readQueue_);
+
+            if (auto future = readExec_.launch(std::move(reader)))
+            {
+                readResults_.push_back(std::move(*future));
+                break;
+            }
+
+            std::this_thread::sleep_until(rateDeadline);
+        }
+
+        auto fileMap = FdMap{ };
+        fileMap.insert({1u, rawOutFd});
+        writeExec_.add(Writer(std::move(fileMap), writeQueue_), ThreadExecutor::Options::DoFinalize);
+
+        targetFds_.push_back(std::move(inFd));
+        targetFds_.push_back(std::move(outFd));
+    }
+
+    bool runOnce()
+    {
+        for (auto &r : readResults_)
+        {
+            if (r.valid() && r.wait_for(0ns) == std::future_status::ready)
+                r.get();
+        }
+
+        std::erase_if(readResults_, [](const auto &r) { return !r.valid(); });
+
+        compressExec_.runOnce();
+
+        writeExec_.runOnce();
+
+        if (readResults_.empty())
+        {
+            writeExec_.waitFinished();
+            compressExec_.waitFinished();
+            return false;
+        }
+
+        return true;
+    }
+
+    void finish() noexcept
+    {
+        readExec_.cancel();
+        compressExec_.cancel();
+        writeExec_.cancel();
+    }
+
+private:
+    std::shared_ptr<BufferPool> readPool_;
+    WaitQueue<BDesc> readQueue_;
+    TaskPool readExec_;
+    std::vector<std::future<int>> readResults_;
+
+    WaitQueue<BDesc> writeQueue_;
+    ThreadExecutor writeExec_;
+
+    ThreadExecutor compressExec_;
+
+    std::vector<std::shared_ptr<ScopedFd>> targetFds_;
 };
 
 CompressOptions parseOptions(int argc, char **argv)
 {
-    constexpr const char *shortOpts = "b:c:i:o:h";
+    constexpr const char *shortOpts = "b:c:i:o:th";
     constexpr const struct option longOpts[] = {
         {"block-size", required_argument, nullptr, 'b'},
         {"chunk-size", required_argument, nullptr, 'c'},
         {"in-path", required_argument, nullptr, 'i'},
         {"out-path", required_argument, nullptr, 'o'},
+        {"cuda-file-io", no_argument, nullptr, 't'},
         {"help", no_argument, nullptr, 'h'},
         {nullptr, 0, nullptr, 0}
     };
@@ -274,6 +458,11 @@ CompressOptions parseOptions(int argc, char **argv)
                 opts.outPath = optarg;
                 break;
             }
+            case 't':
+            {
+                opts.cudaFileIO = true;
+                break;
+            }
             case 'h':
                 usage();
                 std::exit(0);
@@ -293,7 +482,7 @@ CompressOptions parseOptions(int argc, char **argv)
     return opts;
 }
 
-void compress(const CompressOptions &opts)
+void cudaIOCompress(const CompressOptions &opts)
 {
     auto outFd = ScopedFd{open(opts.outPath.c_str(), O_WRONLY | O_DIRECT)};
     auto cuOutHandle = cuFileRegister(outFd);
@@ -310,23 +499,24 @@ void compress(const CompressOptions &opts)
     if (auto err = cudaGetLastError(); err != cudaSuccess)
         throw CudaError(err);
 
+    auto nvcompManager = nvcomp::LZ4Manager{opts.chunkSize, NVCOMP_TYPE_CHAR, stream};
+    auto compressConfig = nvcompManager.configure_compression(opts.blockSize);
+
+    auto gpuScratchBuf = CudaBuffer(nvcompManager.get_required_scratch_buffer_size());
+    nvcompManager.set_scratch_buffer(gpuScratchBuf.data());
+
+    auto gpuOutBuf = CudaBuffer(compressConfig.max_compressed_buffer_size);
+
     auto gpuInBuf = CudaBuffer(opts.blockSize);
     gpuInBuf.fileBufRegister();
-
-    int64_t fileReadMicrosecs = 0;
-    int64_t compressMicrosecs = 0;
 
     size_t outOffset = 0;
 
     size_t fileSize = std::filesystem::file_size(opts.inPath);
 
-    std::chrono::steady_clock::time_point fullCompressBegin = std::chrono::steady_clock::now();
     for (size_t inOffset = 0; inOffset < fileSize; )
     {
-        std::chrono::steady_clock::time_point fileReadBegin = std::chrono::steady_clock::now();
         auto inLen = cuFileRead(cuInHandle, gpuInBuf.data(), opts.blockSize, static_cast<off_t>(inOffset), 0);
-        std::chrono::steady_clock::time_point fileReadEnd = std::chrono::steady_clock::now();
-        fileReadMicrosecs += std::chrono::duration_cast<std::chrono::microseconds>(fileReadEnd - fileReadBegin).count();
 
         if (inLen < 0)
         {
@@ -340,18 +530,7 @@ void compress(const CompressOptions &opts)
             break;
         }
 
-        auto nvcompManager = nvcomp::LZ4Manager{opts.chunkSize, NVCOMP_TYPE_CHAR, stream};
-        auto compressConfig = nvcompManager.configure_compression(opts.blockSize);
-
-        auto gpuScratchBuf = CudaBuffer(nvcompManager.get_required_scratch_buffer_size());
-        nvcompManager.set_scratch_buffer(gpuScratchBuf.data());
-
-        auto gpuOutBuf = CudaBuffer(compressConfig.max_compressed_buffer_size);
-
-        std::chrono::steady_clock::time_point compressBegin = std::chrono::steady_clock::now();
         nvcompManager.compress(gpuInBuf.data(), gpuOutBuf.data(), compressConfig);
-        std::chrono::steady_clock::time_point compressEnd = std::chrono::steady_clock::now();
-        compressMicrosecs += std::chrono::duration_cast<std::chrono::microseconds>(compressEnd - compressBegin).count();
 
         if (auto stat = compressConfig.get_status(); *stat > 0)
         {
@@ -366,14 +545,14 @@ void compress(const CompressOptions &opts)
 
         if (outLen > inLen)
         {
-            spdlog::warn("nvcomp compression failed - output larger than input\n"
+            spdlog::warn("draft.compress: nvcomp compression failed - output larger than input\n"
                          "  is file already compressed?\n"
                          "  output > input -> {} > {}"
                          ,  outLen
                          ,  inLen);
         }
 
-        spdlog::trace("compression info:\n"
+        spdlog::trace("draft.compress: compression info:\n"
                       "  in size:           {} B\n"
                       "  out size:          {} B\n"
                       "  max out size:      {} B\n"
@@ -388,21 +567,32 @@ void compress(const CompressOptions &opts)
         inOffset += static_cast<size_t>(inLen);
         outOffset += static_cast<size_t>(outLen);
     }
-    std::chrono::steady_clock::time_point fullCompressEnd = std::chrono::steady_clock::now();
-    auto fullCompressMicrosecs = std::chrono::duration_cast<std::chrono::microseconds>(fullCompressEnd - fullCompressBegin).count();
-
-    double microsecPerSec = 1'000'000.0;
-    double bytePerGbyte = 1'000'000'000.0;
 
     size_t outFileSize = std::filesystem::file_size(opts.outPath);
 
-    spdlog::info("compression ratio:       {}", static_cast<double>(outFileSize) / static_cast<double>(fileSize));
-    spdlog::info("file read avg. GB/s:     {}"
-                 , (fileSize / bytePerGbyte) / (fileReadMicrosecs / microsecPerSec));
-    spdlog::info("compress avg. GB/s:      {}"
-                 , (fileSize / bytePerGbyte) / (compressMicrosecs / microsecPerSec));
-    spdlog::info("full compress avg. GB/s: {}"
-                 , (fileSize / bytePerGbyte) / (fullCompressMicrosecs / microsecPerSec));
+    spdlog::info("compression ratio: {}"
+                 , static_cast<double>(outFileSize) / static_cast<double>(fileSize));
+}
+
+void compress(const CompressOptions &opts)
+{
+    auto compSession = CompSession(opts);
+
+    compSession.start(opts.inPath, opts.outPath);
+
+    auto deadline = Clock::now();
+    while(compSession.runOnce())
+    {
+        std::this_thread::sleep_until(deadline);
+
+        deadline = Clock::now() + 10ms;
+    }
+
+    size_t fileSize = std::filesystem::file_size(opts.inPath);
+    size_t outFileSize = std::filesystem::file_size(opts.outPath);
+
+    spdlog::info("compression ratio: {}"
+                 , static_cast<double>(outFileSize) / static_cast<double>(fileSize));
 }
 
 } // namespace
@@ -416,87 +606,15 @@ int nvcompress(int argc, char **argv)
 
     auto opts = parseOptions(argc, argv);
 
-    auto inFd = std::make_shared<ScopedFd>(open(opts.inPath.c_str(), O_RDONLY | O_DIRECT));
+    std::chrono::steady_clock::time_point begin = std::chrono::steady_clock::now();
+    if (opts.cudaFileIO)
+        cudaIOCompress(opts);
+    else
+        compress(opts);
+    std::chrono::steady_clock::time_point end = std::chrono::steady_clock::now();
+    auto elapsedTime = std::chrono::duration_cast<std::chrono::microseconds>(end - begin).count() / 1'000'000.0;
 
-    auto outFd = std::make_shared<ScopedFd>(open(opts.outPath.c_str(), O_WRONLY | O_DIRECT));
-    auto rawOutFd = outFd->get();
-    if (rawOutFd < 0)
-    {
-        spdlog::error("unable to open file '{}': {}"
-                      , opts.outPath.c_str()
-                      , std::strerror(errno));
-    }
-
-    auto pool = BufferPool::make(opts.blockSize, 100);
-    auto queue = WaitQueue<BDesc>{ };
-    queue.setSizeLimit(100);
-
-    auto compressQueue = WaitQueue<BDesc>{ };
-    compressQueue.setSizeLimit(10);
-
-    auto compressors = std::vector<Compressor>{ };
-    for (size_t i = 0; i < 100; ++i)
-    {
-        auto compressor = Compressor{queue, compressQueue, opts.chunkSize, opts.blockSize};
-        compressors.push_back(std::move(compressor));
-    }
-
-    size_t fileSize = std::filesystem::file_size(opts.inPath);
-
-    auto readExec = TaskPool{ };
-    readExec.resize(1);
-    readExec.setQueueSizeLimit(50);
-
-    auto readResults = std::vector<std::future<int>>{ };
-    const auto deadline = Clock::now() + 50ms;
-    while (!readExec.cancelled() && Clock::now() < deadline)
-    {
-        auto reader = Reader(inFd, 0u, {0, fileSize}, pool, queue);
-
-        if (auto future = readExec.launch(std::move(reader)))
-        {
-            readResults.push_back(std::move(*future));
-            break;
-        }
-    }
-
-    auto compressExec = ThreadExecutor{ };
-    compressExec.add(std::move(compressors), ThreadExecutor::Options::DoFinalize);
-
-    auto fileMap = FdMap{ };
-    fileMap.insert({1u, rawOutFd});
-    auto writeExec = ThreadExecutor{ };
-    writeExec.add(Writer(std::move(fileMap), compressQueue), ThreadExecutor::Options::DoFinalize);
-
-    while (true)
-    {
-        for (auto &r : readResults)
-        {
-            if (r.valid() && r.wait_for(0ns) == std::future_status::ready)
-                r.get();
-        }
-
-        std::erase_if(readResults, [](const auto &r) { return !r.valid(); });
-
-        compressExec.runOnce();
-
-        writeExec.runOnce();
-
-        if (readResults.empty())
-        {
-            compressExec.cancel();
-            bool stat = compressExec.finished();
-            spdlog::debug("{}", stat);
-            if (!stat)
-            {
-                break;
-            }
-        }
-
-        writeExec.runOnce();
-
-        std::this_thread::sleep_for(50ms);
-    }
+    spdlog::debug("elapsed time: {} s", elapsedTime);
 
     return 0;
 }
