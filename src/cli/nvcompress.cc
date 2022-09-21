@@ -158,7 +158,10 @@ public:
         gpuOutBuf_ = std::make_unique<CudaBuffer>(compressConfig_->max_compressed_buffer_size);
 
         pool_ = BufferPool::make(compressConfig_->max_compressed_buffer_size, 100);
+
         alignPool_ = BufferPool::make(4096, 100);
+
+        alignBuf_ = std::make_shared<Buffer>(alignPool_->get());
     }
 
     bool runOnce(std::stop_token stopToken)
@@ -213,10 +216,10 @@ private:
         }
 
         spdlog::trace("draft.compress: compression info:\n"
-                      "  in size:           {} B\n"
-                      "  out size:          {} B\n"
-                      "  max out size:      {} B\n"
-                      "  compression ratio: {}"
+                      "  in size:      {} B\n"
+                      "  out size:     {} B\n"
+                      "  max out size: {} B\n"
+                      "  comp. ratio:  {}"
                       ,  desc.len
                       ,  outLen
                       ,  compressConfig_->max_compressed_buffer_size
@@ -228,11 +231,11 @@ private:
 
         double newAlignMult = static_cast<double>(alignLen) / 4096.0;
         spdlog::trace("draft.compress: compression alignment:\n"
-                      "  output len:              {}\n"
-                      "  alignment offset:        {}\n"
-                      "  alignment len:           {}\n"
-                      "  output len / 4096.0:     {}\n"
-                      "  alignment len / 4096.0:  {}"
+                      "  out len:             {}\n"
+                      "  align offset:        {}\n"
+                      "  align len:           {}\n"
+                      "  out len / 4096.0:    {}\n"
+                      "  align len / 4096.0:  {}"
                       ,  outLen
                       ,  alignOffset_
                       ,  alignLen
@@ -242,17 +245,15 @@ private:
         if (alignLen > compressConfig_->max_compressed_buffer_size)
             throw std::runtime_error("nvcomp aligned buffer is greater than buffer size");
 
-        spdlog::trace("draft.compress: offset into output file: {}", totalOffset_);
+        spdlog::trace("draft.compress: offset into output file: {}", outOffset_);
         while (!stopToken.stop_requested() &&
-            !compressQueue_->put({outBuf, 1u, totalOffset_, alignLen}, 100ms))
+            !compressQueue_->put({outBuf, 1u, outOffset_, alignLen}, 100ms))
         {
         }
 
-        alignBuf_ = std::make_shared<Buffer>(alignPool_->get());
-
         std::memcpy(alignBuf_->uint8Data(), outBuf->uint8Data() + alignLen, alignOffset_);
 
-        totalOffset_ += static_cast<size_t>(alignLen);
+        outOffset_ += alignLen;
 
         return outLen;
     }
@@ -273,7 +274,7 @@ private:
     std::shared_ptr<Buffer> alignBuf_{ };
     size_t alignOffset_{ };
 
-    size_t totalOffset_{ };
+    size_t outOffset_{ };
 };
 
 class CompSession
@@ -305,7 +306,7 @@ public:
 
     void start(const std::filesystem::path &inPath, const std::filesystem::path &outPath)
     {
-        auto inFd = std::make_shared<ScopedFd>(open(inPath.c_str(), O_RDONLY));
+        auto inFd = std::make_shared<ScopedFd>(open(inPath.c_str(), O_RDONLY | O_DIRECT));
         auto rawInFd = inFd->get();
         if (rawInFd < 0)
         {
@@ -314,7 +315,7 @@ public:
                           , std::strerror(errno));
             throw std::runtime_error("unable to open file for reading");
         }
-        auto outFd = std::make_shared<ScopedFd>(open(outPath.c_str(), O_WRONLY));
+        auto outFd = std::make_shared<ScopedFd>(open(outPath.c_str(), O_WRONLY | O_DIRECT));
         auto rawOutFd = outFd->get();
         if (rawOutFd < 0)
         {
