@@ -61,7 +61,8 @@ if (DRAFT_ENABLE_CUDA)
         GIT_REPOSITORY https://github.com/NVIDIA/nvcomp.git
         GIT_TAG v2.2.0
         CMAKE_ARGS
-            -DCMAKE_INSTALL_PREFIX=${CMAKE_INSTALL_PREFIX})
+            -DCMAKE_INSTALL_PREFIX=${CMAKE_INSTALL_PREFIX}
+            -DNVCOMP_EXTS_ROOT=${NVCOMP_EXTS_ROOT})
 endif ()
 
 ExternalProject_Add(
