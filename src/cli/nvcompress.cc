@@ -36,6 +36,7 @@
 #include <cuda_runtime.h>
 #include <cufile.h>
 #include <nvcomp/lz4.hpp>
+#include <nvcomp/bitcomp.hpp>
 #include <nvcomp.hpp>
 #include <nvcomp/nvcompManagerFactory.hpp>
 #include <spdlog/spdlog.h>
@@ -146,7 +147,7 @@ public:
         if (auto err = cudaGetLastError(); err != cudaSuccess)
             throw CudaError(err);
 
-        nvcompManager_ = std::make_unique<nvcomp::LZ4Manager>(chunkSize, NVCOMP_TYPE_CHAR, stream_);
+        nvcompManager_ = std::make_unique<nvcomp::BitcompManager>(NVCOMP_TYPE_CHAR, 0, stream_);
         compressConfig_ = std::make_unique<nvcomp::CompressionConfig>(nvcompManager_->configure_compression(blockSize));
 
         gpuInBuf_ = std::make_unique<CudaBuffer>(blockSize);
@@ -156,8 +157,8 @@ public:
 
         gpuOutBuf_ = std::make_unique<CudaBuffer>(compressConfig_->max_compressed_buffer_size);
 
-        pool_ = BufferPool::make(compressConfig_->max_compressed_buffer_size, 5);
-        alignPool_ = BufferPool::make(4096, 5);
+        pool_ = BufferPool::make(compressConfig_->max_compressed_buffer_size, 100);
+        alignPool_ = BufferPool::make(4096, 100);
     }
 
     bool runOnce(std::stop_token stopToken)
@@ -215,11 +216,11 @@ private:
                       "  in size:           {} B\n"
                       "  out size:          {} B\n"
                       "  max out size:      {} B\n"
-                      "  compression ratio: {} %"
+                      "  compression ratio: {}"
                       ,  desc.len
                       ,  outLen
                       ,  compressConfig_->max_compressed_buffer_size
-                      ,  static_cast<double>(outLen) / static_cast<double>(desc.len));
+                      ,  static_cast<double>(desc.len) / static_cast<double>(outLen));
 
         auto alignMult = static_cast<double>(outLen) / 4096.0;
         alignOffset_ = static_cast<size_t>((alignMult - std::floor(alignMult)) * 4096.0);
@@ -262,7 +263,7 @@ private:
     BufQueue *compressQueue_{ };
 
     cudaStream_t stream_{ };
-    std::unique_ptr<nvcomp::LZ4Manager> nvcompManager_{ };
+    std::unique_ptr<nvcomp::nvcompManagerBase> nvcompManager_{ };
     std::unique_ptr<nvcomp::CompressionConfig> compressConfig_{ };
 
     std::unique_ptr<CudaBuffer> gpuInBuf_{ };
@@ -304,7 +305,7 @@ public:
 
     void start(const std::filesystem::path &inPath, const std::filesystem::path &outPath)
     {
-        auto inFd = std::make_shared<ScopedFd>(open(inPath.c_str(), O_RDONLY | O_DIRECT));
+        auto inFd = std::make_shared<ScopedFd>(open(inPath.c_str(), O_RDONLY));
         auto rawInFd = inFd->get();
         if (rawInFd < 0)
         {
@@ -313,7 +314,7 @@ public:
                           , std::strerror(errno));
             throw std::runtime_error("unable to open file for reading");
         }
-        auto outFd = std::make_shared<ScopedFd>(open(outPath.c_str(), O_WRONLY | O_DIRECT));
+        auto outFd = std::make_shared<ScopedFd>(open(outPath.c_str(), O_WRONLY));
         auto rawOutFd = outFd->get();
         if (rawOutFd < 0)
         {
@@ -499,7 +500,7 @@ void cudaIOCompress(const CompressOptions &opts)
     if (auto err = cudaGetLastError(); err != cudaSuccess)
         throw CudaError(err);
 
-    auto nvcompManager = nvcomp::LZ4Manager{opts.chunkSize, NVCOMP_TYPE_CHAR, stream};
+    auto nvcompManager = nvcomp::BitcompManager{NVCOMP_TYPE_CHAR, 0, stream};
     auto compressConfig = nvcompManager.configure_compression(opts.blockSize);
 
     auto gpuScratchBuf = CudaBuffer(nvcompManager.get_required_scratch_buffer_size());
@@ -556,11 +557,11 @@ void cudaIOCompress(const CompressOptions &opts)
                       "  in size:           {} B\n"
                       "  out size:          {} B\n"
                       "  max out size:      {} B\n"
-                      "  compression ratio: {} %"
+                      "  compression ratio: {}"
                       ,  inLen
                       ,  outLen
                       ,  compressConfig.max_compressed_buffer_size
-                      ,  static_cast<double>(outLen) / static_cast<double>(inLen));
+                      ,  static_cast<double>(inLen) / static_cast<double>(outLen));
 
         cuFileWrite(cuOutHandle, gpuOutBuf.data(), outLen, static_cast<off_t>(outOffset), 0);
 
@@ -571,7 +572,7 @@ void cudaIOCompress(const CompressOptions &opts)
     size_t outFileSize = std::filesystem::file_size(opts.outPath);
 
     spdlog::info("compression ratio: {}"
-                 , static_cast<double>(outFileSize) / static_cast<double>(fileSize));
+                 , static_cast<double>(fileSize) / static_cast<double>(outFileSize));
 }
 
 void compress(const CompressOptions &opts)
@@ -592,7 +593,7 @@ void compress(const CompressOptions &opts)
     size_t outFileSize = std::filesystem::file_size(opts.outPath);
 
     spdlog::info("compression ratio: {}"
-                 , static_cast<double>(outFileSize) / static_cast<double>(fileSize));
+                 , static_cast<double>(fileSize) / static_cast<double>(outFileSize));
 }
 
 } // namespace
